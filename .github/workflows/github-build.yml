@@ -1,0 +1,141 @@
+name: Desktop build
+run-name: Build ${{ inputs.platform }} / ${{ inputs.request_id }} / ${{ inputs.source_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Target platforms
+        type: choice
+        default: windows
+        options: [windows, macos, all]
+      source_sha:
+        description: Exact private source commit
+        required: true
+        type: string
+      request_id:
+        description: Unique build request identifier
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-build
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: source
+    env:
+      BUILD_ARTIFACT_KEY: ${{ secrets.BUILD_ARTIFACT_KEY }}
+      SOURCE_SNAPSHOT_COMMIT: ${{ inputs.source_sha }}
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SOURCE_REPOSITORY }}
+          ref: ${{ inputs.source_sha }}
+          ssh-key: ${{ secrets.BUILD_SOURCE_SSH_KEY }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: source/package.json
+      - name: Validate build plan
+        id: plan
+        env:
+          BUILD_PLATFORM: ${{ inputs.platform }}
+        run: node scripts/github-build-crypto.mjs run plan python scripts/github-build-entry.py plan
+      - name: Install dependencies
+        run: node scripts/github-build-crypto.mjs run install python scripts/github-build-entry.py install
+      - name: Run checks
+        run: node scripts/github-build-crypto.mjs run checks python scripts/github-build-entry.py checks
+      - name: Encrypt diagnostics
+        if: always()
+        run: python scripts/github-build-entry.py seal
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Build-checks
+          path: source/encrypted-artifacts/*.enc
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  build:
+    needs: checks
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.checks.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: source
+    env:
+      NODE_OPTIONS: --max-old-space-size=8192
+      BUILD_TARGET: ${{ matrix.target }}
+      SOURCE_SNAPSHOT_COMMIT: ${{ inputs.source_sha }}
+      BUILD_ARTIFACT_KEY: ${{ secrets.BUILD_ARTIFACT_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SOURCE_REPOSITORY }}
+          ref: ${{ inputs.source_sha }}
+          ssh-key: ${{ secrets.BUILD_SOURCE_SSH_KEY }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: source/package.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.1'
+          targets: ${{ matrix.target }}
+      - name: Check build tooling
+        run: node scripts/github-build-crypto.mjs run tooling python scripts/github-build-entry.py tooling
+      - name: Install dependencies
+        run: node scripts/github-build-crypto.mjs run install python scripts/github-build-entry.py install
+      - name: Build application
+        run: node scripts/github-build-crypto.mjs run build python scripts/github-build-entry.py build
+      - name: Run native checks
+        run: node scripts/github-build-crypto.mjs run native-checks python scripts/github-build-entry.py test
+      - name: Verify and package
+        run: node scripts/github-build-crypto.mjs run package python scripts/github-build-entry.py package
+      - name: Encrypt output
+        if: always()
+        run: python scripts/github-build-entry.py seal
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Build-${{ matrix.target }}
+          path: source/encrypted-artifacts/*.enc
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  ready:
+    needs: [checks, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: echo 'Build checks passed. Retrieve and verify encrypted output locally.' >> "$GITHUB_STEP_SUMMARY"
