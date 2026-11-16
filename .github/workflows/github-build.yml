@@ -8,7 +8,7 @@ on:
         description: Target platforms
         type: choice
         default: windows
-        options: [windows, macos, all]
+        options: [windows, macos, macos-arm64, all]
       source_sha:
         description: Exact private source commit
         required: true
